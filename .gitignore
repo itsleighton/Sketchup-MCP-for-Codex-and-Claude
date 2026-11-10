@@ -1,0 +1,11 @@
+# Built release files: attach these to a GitHub Release instead of committing them
+dist/
+
+# Google Drive / Windows clutter
+desktop.ini
+Thumbs.db
+
+# Leftovers from setup runs
+install-uv*.ps1
+*.backup-*
+*.original-backup

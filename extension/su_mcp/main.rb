@@ -3,6 +3,13 @@ require 'json'
 require 'socket'
 require 'fileutils'
 
+# Optional: identifies which AI app (Claude, Codex) sent each request.
+begin
+  require File.join(File.dirname(__FILE__), 'client_identity')
+rescue StandardError, LoadError => e
+  puts "MCP: client identification unavailable (#{e.message})"
+end
+
 puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
 
@@ -89,7 +96,26 @@ module SU_MCP
       log "Server stopped"
     end
 
+    # Name of the AI app ('Claude', 'Codex', 'Other (...)', 'Unknown') whose
+    # request is being handled right now; nil between requests.
+    attr_reader :current_client
+
     private
+
+    # Which app owns the client end of this connection. Never raises.
+    def identify_client(sock)
+      return 'Unknown' unless defined?(SU_MCP::ClientIdentity)
+      SU_MCP::ClientIdentity.label_for(sock)
+    rescue StandardError, ScriptError
+      'Unknown'
+    end
+
+    def with_client(p)
+      @current_client = p[:client]
+      yield
+    ensure
+      @current_client = nil
+    end
 
     # One non-blocking pass: accept waiting connections, then read whatever
     # each pending client has sent. Never waits on a socket.
@@ -97,8 +123,9 @@ module SU_MCP
       MAX_ACCEPTS_PER_TICK.times do
         begin
           sock = @server.accept_nonblock
-          log "Client accepted"
-          @pending << { sock: sock, buf: String.new, deadline: Time.now + REQUEST_TIMEOUT }
+          app = identify_client(sock)
+          log "Client accepted (#{app})"
+          @pending << { sock: sock, buf: String.new, deadline: Time.now + REQUEST_TIMEOUT, client: app }
         rescue IO::WaitReadable
           break
         end
@@ -124,14 +151,14 @@ module SU_MCP
 
         if p[:buf].include?("\n")
           drop_client(p, false)
-          process_request(p[:sock], p[:buf].split("\n", 2).first + "\n")
+          with_client(p) { process_request(p[:sock], p[:buf].split("\n", 2).first + "\n") }
           close_client(p[:sock])
         elsif p[:buf].bytesize > MAX_REQUEST_BYTES
           log "Request too large, dropping client"
           drop_client(p)
         elsif done
           drop_client(p, false)
-          process_request(p[:sock], p[:buf]) unless p[:buf].empty?
+          with_client(p) { process_request(p[:sock], p[:buf]) } unless p[:buf].empty?
           close_client(p[:sock])
         elsif Time.now > p[:deadline]
           log "Client sent no complete request within #{REQUEST_TIMEOUT}s, dropping it"

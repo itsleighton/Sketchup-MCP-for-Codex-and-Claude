@@ -15,6 +15,10 @@
 # SU_MCP::Server#handle_jsonrpc_request. su_mcp closes the client socket
 # after each response, so ACTIVE means "a request arrived within
 # ACTIVE_WINDOW seconds", not "a client is attached".
+#
+# WHICH APP: su_mcp sets Server#current_client ('Claude', 'Codex', ...) while
+# it handles a request (see su_mcp/client_identity.rb). The tracker records
+# it per app, and the panel shows which apps were active recently.
 
 require 'sketchup.rb'
 
@@ -39,6 +43,7 @@ module ElmMCPStatus
   @last_method   ||= nil
   @request_count ||= 0
   @patched       ||= false
+  @clients       ||= {} # app name => { count:, last: Time }
 
   def self.icon(name)
     File.join(DIR, name)
@@ -46,9 +51,17 @@ module ElmMCPStatus
 
   # --- activity tracking -------------------------------------------------
 
-  def self.note_activity(request)
+  def self.note_activity(request, client = nil)
     @last_activity = Time.now
     @request_count = @request_count.to_i + 1
+    begin
+      name = client.to_s.empty? ? 'Unknown' : client.to_s
+      entry = (@clients[name] ||= { count: 0, last: nil })
+      entry[:count] += 1
+      entry[:last] = @last_activity
+    rescue
+      nil
+    end
     @last_method = begin
       if request.is_a?(Hash)
         m  = request["method"] || request[:method]
@@ -78,9 +91,33 @@ module ElmMCPStatus
     @patched
   end
 
+  # Per-app stats, most recent first: [[name, {count:, last:}], ...]
+  def self.clients
+    (@clients || {}).sort_by { |_n, e| -(e[:last] ? e[:last].to_f : 0) }
+  end
+
+  # Apps that sent a request within ACTIVE_WINDOW, most recent first.
+  def self.active_clients
+    now = Time.now
+    clients.select { |_n, e| e[:last] && now - e[:last] <= ACTIVE_WINDOW }.map(&:first)
+  end
+
+  def self.ago(t)
+    return "never" if t.nil?
+    a = (Time.now - t).round
+    return "#{a}s ago" if a < 60
+    return "#{(a / 60).round}m ago" if a < 3600
+    "#{(a / 3600.0).round(1)}h ago"
+  end
+
   module ActivityTracker
     def handle_jsonrpc_request(request)
-      ElmMCPStatus.note_activity(request)
+      who = begin
+              respond_to?(:current_client) ? current_client : nil
+            rescue
+              nil
+            end
+      ElmMCPStatus.note_activity(request, who)
       super
     end
     private :handle_jsonrpc_request
@@ -150,7 +187,9 @@ module ElmMCPStatus
   # Kept short deliberately: the panel is ~125px wide.
   def self.subline(s = state)
     case s
-    when :active    then ":#{port} - #{ago_text}"
+    when :active
+      apps = active_clients
+      apps.empty? ? ":#{port} - #{ago_text}" : "#{apps.join(' + ')} - #{ago_text}"
     when :listening then ":#{port} - idle"
     when :stopped   then "not listening"
     else                 "extension absent"
@@ -232,6 +271,9 @@ module ElmMCPStatus
     meta = "MCP #{headline(s)} on port #{port}\n"
     meta += "#{request_count} requests handled, last #{ago_text}"
     meta += "\nlast method: #{last_method}" if last_method
+    clients.each do |name, e|
+      meta += "\n#{name}: #{e[:count]} requests, last #{ago(e[:last])}"
+    end
     meta += "\nTRACKING NOT ATTACHED" unless @patched
     @dlg.execute_script(
       "window.setState(#{s.to_s.inspect},#{headline(s).inspect}," \
@@ -327,6 +369,15 @@ module ElmMCPStatus
       out << "Requests handled:  #{request_count}"
       out << "Last request:      #{ago_text}"
       out << "Last method:       #{last_method || '-'}"
+      out << ""
+      out << "By app:"
+      if clients.empty?
+        out << "  (no requests yet)"
+      else
+        clients.each do |name, e|
+          out << "  #{name.ljust(10)} #{e[:count]} requests, last #{ago(e[:last])}"
+        end
+      end
     else
       out << "SU_MCP::Server was not found in memory."
     end

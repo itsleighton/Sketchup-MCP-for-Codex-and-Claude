@@ -43,7 +43,9 @@ Setup needs internet access. It installs, for your user only (no admin rights):
 ## Use
 
 1. In SketchUp: **Extensions > MCP Server > Start Server**. A small status light shows
-   LISTENING (amber) or ACTIVE (green).
+   LISTENING (amber) or ACTIVE (green). While active it also names the app that's talking to
+   SketchUp, e.g. `Claude - 3s ago` or `Claude + Codex - 3s ago`. Hover the light, or click the
+   **MCP Info** toolbar button, for request counts per app.
 2. Open Claude or Codex and start a **new chat**. Try: *"What's selected in SketchUp?"*
 3. When finished: **Extensions > MCP Server > Stop Server**.
 
@@ -57,6 +59,16 @@ connector. In Codex, make sure the chat runs **locally**, not in the cloud.
 
 `create_component`, `delete_component`, `transform_component`, `get_selection`, `set_material`,
 `export_scene`, `create_mortise_tenon`, `create_dovetail`, `create_finger_joint`, `eval_ruby`.
+
+### How SketchUp knows which app is connected
+
+Requests don't carry an app name, so the extension asks Windows which process owns each incoming
+connection and follows its parent processes: `sketchup-mcp.exe` started by `claude.exe` shows as
+**Claude**, by `codex.exe` as **Codex**. A connector started by another app shows as
+`Other (app.exe)`; anything else (e.g. a script talking to port 9876 directly) shows as
+**Unknown**. It identifies the app, not the chat or the person. The lookup uses built-in Windows
+APIs, runs once per connector process, and never blocks a request (on failure it reports
+Unknown).
 
 ## Troubleshooting
 
@@ -91,6 +103,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File setup\codex\Setup.ps1
 extension/            SketchUp extension source (packed into SketchUp-MCP.rbz)
   su_mcp.rb             extension loader
   su_mcp/main.rb        MCP server inside SketchUp
+  su_mcp/client_identity.rb  identifies which app (Claude/Codex) owns a connection
   mcp_status_monitor.rb status-light panel and toolbar
 setup/claude/Setup.ps1  installs connector + registers it with Claude Desktop
 setup/codex/Setup.ps1   installs connector + registers it with Codex
@@ -105,7 +118,8 @@ dist/                   built files to attach to a GitHub Release (not committed
 powershell -NoProfile -ExecutionPolicy Bypass -File setup\launcher\build.ps1
 ```
 
-`SketchUp-MCP.rbz` is a zip of the `extension/` folder's contents (`su_mcp.rb`, `su_mcp/`,
+`SketchUp-MCP.rbz` is a zip of the `extension/` folder's contents (`su_mcp.rb`, `su_mcp/` with
+`main.rb` and `client_identity.rb`,
 `mcp_status_monitor.rb`, `mcp_status_monitor/`) renamed to `.rbz`. Rebuild the EXEs whenever a
 `Setup.ps1` changes — each EXE carries its own copy of the script.
 
@@ -119,6 +133,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File setup\launcher\build.ps1
 - The uv installer is downloaded to the temp folder and deleted afterwards.
 - The Codex setup also finds a Codex CLI installed with npm (`codex.cmd`).
 - Added the status-light panel (`mcp_status_monitor.rb`).
+- **The status light shows which app is talking to SketchUp** (Claude, Codex, or Unknown), with
+  per-app request counts in the tooltip and the MCP Info dialog.
 
 ## Credits and license
 

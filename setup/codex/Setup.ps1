@@ -46,6 +46,41 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Codex registration failed.' }
     & $cli mcp get sketchup
     if ($LASTEXITCODE -ne 0) { throw 'Codex did not find the registered connector.' }
+    # "codex mcp add" writes only the command line, so add the settings it leaves out.
+    # eval_ruby runs arbitrary Ruby under this Windows account, so it must stay behind an
+    # approval prompt; without this block a fresh install would run it unprompted.
+    $codexConfig = Join-Path $env:USERPROFILE '.codex\config.toml'
+    if (Test-Path -LiteralPath $codexConfig) {
+        $lines = New-Object 'Collections.Generic.List[string]'
+        Get-Content -LiteralPath $codexConfig | ForEach-Object { $lines.Add($_) }
+        $header = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim() -eq '[mcp_servers.sketchup]') { $header = $i; break }
+        }
+        if ($header -ge 0) {
+            $end = $lines.Count
+            for ($i = $header + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i].TrimStart().StartsWith('[')) { $end = $i; break }
+            }
+            $table = ''
+            if ($end -gt ($header + 1)) { $table = ($lines[($header + 1)..($end - 1)]) -join "`n" }
+            $insert = @()
+            if ($table -notmatch '(?m)^\s*startup_timeout_sec\s*=') { $insert += 'startup_timeout_sec = 30' }
+            if ($table -notmatch '(?m)^\s*tool_timeout_sec\s*=') { $insert += 'tool_timeout_sec = 120' }
+            if ($insert.Count -gt 0) { $lines.InsertRange($header + 1, [string[]]$insert) }
+        }
+        if ((($lines) -join "`n") -notmatch '(?m)^\s*\[mcp_servers\.sketchup\.tools\.eval_ruby\]') {
+            $lines.Add('')
+            $lines.Add('[mcp_servers.sketchup.tools.eval_ruby]')
+            $lines.Add('approval_mode = "approve"')
+        }
+        $codexStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        Copy-Item -LiteralPath $codexConfig -Destination ($codexConfig + '.backup-' + $codexStamp) -Force
+        [IO.File]::WriteAllLines($codexConfig, $lines, (New-Object Text.UTF8Encoding($false)))
+        Write-Host 'Added the eval_ruby approval prompt and connector timeouts.'
+    } else {
+        Write-Host 'WARNING: config.toml not found; eval_ruby will run without an approval prompt.' -ForegroundColor Yellow
+    }
     Write-Host 'Setup complete. Restart Codex after installing the shared SketchUp extension.'
 } catch {
     Write-Host ('FAILED: ' + $_.Exception.Message) -ForegroundColor Red

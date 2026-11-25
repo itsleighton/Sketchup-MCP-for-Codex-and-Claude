@@ -56,7 +56,14 @@ start takes port **9876**, which is the port the AI connects to (the *primary*).
 takes the next free port: 9877, 9878, and so on up to 9885. The status light shows each window's
 port.
 
-The AI works through the primary instance and reaches the others through `eval_ruby`:
+**The AI follows the window you're working in.** Click into a SketchUp window, and every request
+from Claude or Codex goes to that window's model, with nothing to type. Each window notes when you
+click into it, and the primary passes requests to the window you used last. If that window has
+closed, the primary handles the request itself. To keep the AI in the primary window, uncheck
+**Extensions > MCP Server > Follow Active Window**.
+
+To work with a window other than the active one, the AI can also reach the others directly
+through `eval_ruby`:
 
 ```ruby
 SU_MCP.instances                                   # list every running SketchUp: port, model title, path
@@ -66,8 +73,11 @@ SU_MCP.remote(9877, "Sketchup.active_model.title")                   # ...or pic
 
 You can name the target by port or by part of its model's title or path. `remote` returns the other
 window's result as text, and a call fails after 10 seconds. To change which window is the primary,
-stop the servers and start the one you want first. All instances must run version 1.6.0 or later;
-an older one still answers `remote`, but `instances` lists it without a title.
+stop the servers and start the one you want first. Install the same version in every window.
+Following the active window needs 1.7.0 or later.
+
+While a request is running in another window, it can't call back into the primary, because the
+primary is waiting for it. That call fails at once with a message saying so.
 
 ### Which app is Codex?
 

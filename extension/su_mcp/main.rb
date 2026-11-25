@@ -53,11 +53,27 @@ module SU_MCP
   end
 
   # Sends one JSON-RPC tools/call to another instance and returns the text.
+  # Marked _mcp_direct so the primary runs it itself instead of forwarding
+  # it to the active window.
   def self.call_port(port, tool, args = {}, timeout = REMOTE_TIMEOUT)
     raise ArgumentError, "Port #{port} is this SketchUp; run the code directly" if port == own_port
     raise ArgumentError, "Port #{port} is outside #{PORT_RANGE}" unless PORT_RANGE.cover?(port)
-    req = { jsonrpc: "2.0", method: "tools/call",
+    if port == PRIMARY_PORT && @handling_forwarded
+      # The primary is blocked waiting for this request to finish, so it
+      # cannot answer; fail now instead of after the timeout.
+      raise "This request came through the primary window (port #{PRIMARY_PORT}), which is " \
+            "waiting for it and cannot answer. Turn off Follow Active Window or click the " \
+            "primary SketchUp window to work there."
+    end
+    req = { jsonrpc: "2.0", method: "tools/call", _mcp_direct: true,
             params: { name: tool, arguments: args }, id: 1 }.to_json + "\n"
+    resp = JSON.parse(send_line(port, req, timeout))
+    raise "SketchUp on port #{port}: #{resp['error']['message']}" if resp['error']
+    resp['result']['content'][0]['text']
+  end
+
+  # Writes one request line to another instance and returns its reply line.
+  def self.send_line(port, req, timeout)
     sock = Socket.tcp('127.0.0.1', port, connect_timeout: 0.5)
     begin
       sock.write(req)
@@ -75,9 +91,86 @@ module SU_MCP
     ensure
       sock.close rescue nil
     end
-    resp = JSON.parse(buf)
-    raise "SketchUp on port #{port}: #{resp['error']['message']}" if resp['error']
-    resp['result']['content'][0]['text']
+    buf
+  end
+
+  # ---- Follow the active window -------------------------------------------
+  #
+  # Each running server notes when its SketchUp window comes to the front and
+  # records its port in a shared file. The primary (9876, where Claude and
+  # Codex connect) hands every request to the window you used last, so the AI
+  # works in whichever model you are looking at.
+
+  ACTIVE_FILE = File.join(ENV['TEMP'] || ENV['TMP'] || Dir.tmpdir,
+                          'sketchup-mcp', 'active-window.json') unless defined?(ACTIVE_FILE)
+  # A forwarded call must finish inside the connector's 15 s socket timeout.
+  FORWARD_TIMEOUT = 13.0 unless defined?(FORWARD_TIMEOUT)
+  FOLLOW_KEY = 'FollowActiveWindow' unless defined?(FOLLOW_KEY)
+
+  class << self
+    attr_writer :handling_forwarded
+  end
+
+  def self.follow_active?
+    Sketchup.read_default('SU_MCP', FOLLOW_KEY, true) ? true : false
+  end
+
+  def self.toggle_follow_active
+    Sketchup.write_default('SU_MCP', FOLLOW_KEY, !follow_active?)
+  end
+
+  def self.user32
+    @user32 ||= begin
+      require 'fiddle'
+      u = Fiddle.dlopen('user32.dll')
+      {
+        fg:  Fiddle::Function.new(u['GetForegroundWindow'], [], Fiddle::TYPE_VOIDP),
+        pid: Fiddle::Function.new(u['GetWindowThreadProcessId'],
+                                  [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP], Fiddle::TYPE_INT)
+      }
+    end
+  end
+
+  # True when a window of this SketchUp process is in front.
+  def self.foreground?
+    hwnd = user32[:fg].call
+    return false if hwnd.null?
+    buf = Fiddle::Pointer.malloc(4, Fiddle::RUBY_FREE)
+    user32[:pid].call(hwnd, buf)
+    buf[0, 4].unpack1('L') == Process.pid
+  rescue StandardError, ScriptError
+    false
+  end
+
+  # Called from the server timer. Writes the file only when this window has
+  # just come to the front.
+  def self.check_focus
+    now = foreground?
+    if now && !@was_foreground
+      mark_active
+    end
+    @was_foreground = now
+  end
+
+  def self.mark_active
+    port = own_port
+    return unless port
+    FileUtils.mkdir_p(File.dirname(ACTIVE_FILE))
+    m = Sketchup.active_model
+    File.write(ACTIVE_FILE, { port: port, pid: Process.pid,
+                              title: m ? m.title : nil, at: Time.now.to_f }.to_json)
+  rescue StandardError
+    nil
+  end
+
+  # Port of the window used last, or nil when it is this one or gone.
+  def self.active_port
+    return nil unless File.exist?(ACTIVE_FILE)
+    port = JSON.parse(File.read(ACTIVE_FILE))['port'].to_i
+    return nil if port == own_port || !PORT_RANGE.cover?(port)
+    port_in_use?(port) ? port : nil
+  rescue StandardError
+    nil
   end
 
   # Every running instance, this one included. Ports with nothing listening
@@ -186,6 +279,7 @@ module SU_MCP
         @timer_id = UI.start_timer(0.1, true) {
           begin
             poll_clients if @running
+            SU_MCP.check_focus if @running
           rescue StandardError => e
             log "Timer error: #{e.message}"
             log e.backtrace.join("\n")
@@ -237,6 +331,7 @@ module SU_MCP
       yield
     ensure
       @current_client = nil
+      SU_MCP.handling_forwarded = false
     end
 
     # One non-blocking pass: accept waiting connections, then read whatever
@@ -301,6 +396,31 @@ module SU_MCP
       nil
     end
 
+    # On the primary, hands the request to the SketchUp window used last and
+    # returns its reply line. Returns nil to handle the request here: this is
+    # not the primary, following is off, this window is the active one, the
+    # request came from SU_MCP.remote, or the other window has gone away.
+    def forward_to_active(request)
+      direct = request.delete("_mcp_direct")
+      return nil unless @port == SU_MCP::PRIMARY_PORT && SU_MCP.follow_active?
+      return nil if direct
+      return nil if request.dig("params", "name") == "instance_info"
+      port = SU_MCP.active_port
+      return nil unless port
+      log "Forwarding to the active window on port #{port}"
+      line = request.merge("_mcp_client" => @current_client || "Unknown").to_json + "\n"
+      reply = SU_MCP.send_line(port, line, SU_MCP::FORWARD_TIMEOUT)
+      reply.end_with?("\n") ? reply : reply + "\n"
+    rescue Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ETIMEDOUT
+      log "Active window on port #{port} did not accept the request; handling it here"
+      nil
+    rescue StandardError => e
+      log "Forwarding failed: #{e.message}"
+      { jsonrpc: request["jsonrpc"] || "2.0",
+        error: { code: -32603, message: "Active SketchUp window (port #{port}): #{e.message}" },
+        id: request["id"] }.to_json + "\n"
+    end
+
     def process_request(client, data)
       log "Raw data: #{data.inspect}"
       original_id = nil
@@ -325,6 +445,17 @@ module SU_MCP
         end
 
         log "Processed request: #{request.inspect}"
+        # Forwarded from the primary: show the real app on this window's light.
+        forwarded = request.key?("_mcp_client")
+        @current_client = request.delete("_mcp_client") if forwarded
+        SU_MCP.handling_forwarded = forwarded
+
+        if (reply = forward_to_active(request))
+          client.write(reply)
+          client.flush
+          return
+        end
+
         response = handle_jsonrpc_request(request)
         response_json = response.to_json + "\n"
 
@@ -2061,6 +2192,8 @@ module SU_MCP
     menu = UI.menu("Plugins").add_submenu("MCP Server")
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
+    item = menu.add_item("Follow Active Window") { SU_MCP.toggle_follow_active }
+    menu.set_validation_proc(item) { SU_MCP.follow_active? ? MF_CHECKED : MF_UNCHECKED }
     
     file_loaded(__FILE__)
   end

@@ -14,6 +14,116 @@ puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
 
 module SU_MCP
+  PRIMARY_PORT = 9876 unless defined?(PRIMARY_PORT)
+  PORT_RANGE   = (9876..9885) unless defined?(PORT_RANGE)
+  # Kept under the connector's 15 s socket timeout so a slow remote call
+  # fails cleanly instead of breaking the AI's connection.
+  REMOTE_TIMEOUT = 10.0 unless defined?(REMOTE_TIMEOUT)
+
+  # ---- Multi-instance helpers (call these from eval_ruby) -----------------
+  #
+  #   SU_MCP.instances                      # every running SketchUp MCP server
+  #   SU_MCP.remote(9877, "Sketchup.active_model.title")
+  #   SU_MCP.remote("Electrical", "Sketchup.active_model.entities.size")
+  #
+  # A target is a port number or part of the other model's title/path.
+  # remote returns the other instance's eval_ruby result as a String.
+
+  def self.server
+    @server
+  end
+
+  def self.own_port
+    srv = @server
+    return nil unless srv && srv.instance_variable_get(:@running)
+    srv.instance_variable_get(:@port)
+  end
+
+  def self.local_info
+    m = Sketchup.active_model
+    {
+      pid: Process.pid,
+      port: own_port,
+      primary: own_port == PRIMARY_PORT,
+      title: m ? m.title : nil,
+      path: m ? m.path : nil,
+      entities: m ? m.entities.size : 0,
+      sketchup: Sketchup.version
+    }
+  end
+
+  # Sends one JSON-RPC tools/call to another instance and returns the text.
+  def self.call_port(port, tool, args = {}, timeout = REMOTE_TIMEOUT)
+    raise ArgumentError, "Port #{port} is this SketchUp; run the code directly" if port == own_port
+    raise ArgumentError, "Port #{port} is outside #{PORT_RANGE}" unless PORT_RANGE.cover?(port)
+    req = { jsonrpc: "2.0", method: "tools/call",
+            params: { name: tool, arguments: args }, id: 1 }.to_json + "\n"
+    sock = Socket.tcp('127.0.0.1', port, connect_timeout: 0.5)
+    begin
+      sock.write(req)
+      deadline = Time.now + timeout
+      buf = String.new
+      until buf.include?("\n")
+        left = deadline - Time.now
+        raise "SketchUp on port #{port} did not answer within #{timeout}s" if left <= 0
+        if IO.select([sock], nil, nil, left)
+          chunk = sock.read_nonblock(65536, exception: false)
+          break if chunk.nil?
+          buf << chunk unless chunk == :wait_readable
+        end
+      end
+    ensure
+      sock.close rescue nil
+    end
+    resp = JSON.parse(buf)
+    raise "SketchUp on port #{port}: #{resp['error']['message']}" if resp['error']
+    resp['result']['content'][0]['text']
+  end
+
+  # Every running instance, this one included. Ports with nothing listening
+  # are refused at once, so the scan is quick.
+  # True when something is listening on the port. Binding is instant, while a
+  # refused connect on Windows can take a second or more per port.
+  def self.port_in_use?(port)
+    TCPServer.new('127.0.0.1', port).close
+    false
+  rescue Errno::EADDRINUSE, Errno::EACCES
+    true
+  end
+
+  def self.instances
+    PORT_RANGE.map do |port|
+      next local_info if port == own_port
+      next nil unless port_in_use?(port)
+      begin
+        JSON.parse(call_port(port, "instance_info", {}, 3.0), symbolize_names: true)
+      rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EADDRNOTAVAIL, IOError
+        nil
+      rescue StandardError => e
+        # Something answers on the port but is an older build without
+        # instance_info; still list it so it can be reached.
+        { port: port, title: nil, note: e.message }
+      end
+    end.compact
+  end
+
+  def self.resolve_port(target)
+    return target if target.is_a?(Integer)
+    t = target.to_s.downcase
+    hits = instances.select do |i|
+      i[:port] != own_port &&
+        ((i[:title] || '').downcase.include?(t) || (i[:path] || '').downcase.include?(t))
+    end
+    raise "No other SketchUp has a model matching '#{target}'" if hits.empty?
+    raise "'#{target}' matches several models: #{hits.map { |i| i[:title] }.join(', ')}" if hits.size > 1
+    hits.first[:port]
+  end
+
+  # Runs Ruby in another SketchUp instance and returns its result as a String.
+  def self.remote(target, code)
+    call_port(resolve_port(target), "eval_ruby", { code: code })
+  end
+
   class Server
     def initialize
       @port = 9876
@@ -53,10 +163,22 @@ module SU_MCP
       return if @running
 
       begin
-        log "Starting server on localhost:#{@port}..."
-
-        @server = TCPServer.new('127.0.0.1', @port)
-        log "Server created on port #{@port}"
+        # The first SketchUp to start gets 9876 (the port the AI connector
+        # uses). Each additional SketchUp takes the next free port, and the
+        # first one reaches it through SU_MCP.remote.
+        @server = nil
+        SU_MCP::PORT_RANGE.each do |p|
+          begin
+            @server = TCPServer.new('127.0.0.1', p)
+            @port = p
+            break
+          rescue Errno::EADDRINUSE, Errno::EACCES
+            log "Port #{p} is in use (another SketchUp?), trying the next one..."
+          end
+        end
+        raise "No free port in #{SU_MCP::PORT_RANGE}" unless @server
+        log "Server created on port #{@port}" +
+            (@port == SU_MCP::PRIMARY_PORT ? " (primary: the AI connects here)" : " (secondary: reach it with SU_MCP.remote)")
 
         @pending = []
         @running = true
@@ -327,6 +449,8 @@ module SU_MCP
           create_finger_joint(args)
         when "eval_ruby"
           eval_ruby(args)
+        when "instance_info"
+          { success: true, result: SU_MCP.local_info.to_json }
         else
           raise "Unknown tool: #{tool_name}"
         end

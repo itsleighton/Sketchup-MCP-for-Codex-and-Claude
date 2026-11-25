@@ -13,7 +13,7 @@ Windows PC through the [Model Context Protocol](https://modelcontextprotocol.io)
 
 | Part | What it is | Installed by |
 |---|---|---|
-| **SketchUp extension** | Ruby code inside SketchUp. Listens on `127.0.0.1:9876` after *Start Server*. | `SketchUp-MCP.rbz` |
+| **SketchUp extension** | Ruby code inside SketchUp. Listens on `127.0.0.1:9876` after *Start Server* (a second SketchUp takes 9877, and so on). | `SketchUp-MCP.rbz` |
 | **Connector** (`sketchup-mcp.exe`) | One shared program the AI app starts; it relays between the app and SketchUp. Downloaded from PyPI ([`sketchup-mcp` 0.1.17](https://pypi.org/project/sketchup-mcp/0.1.17/)). | Either setup EXE |
 | **Claude registration** | An entry in `%APPDATA%\Claude\claude_desktop_config.json` | `Setup-Claude.exe` |
 | **Codex registration** | An entry in `%USERPROFILE%\.codex\config.toml` | `Setup-Codex.exe` |
@@ -48,6 +48,26 @@ Setup needs internet access. It installs, for your user only (no admin rights):
    **MCP Info** toolbar button, for request counts per app.
 2. Open Claude or Codex and start a **new chat**. Try: *"What's selected in SketchUp?"*
 3. When finished: **Extensions > MCP Server > Stop Server**.
+
+### Two or more SketchUp windows
+
+SketchUp opened twice runs as separate programs, and each one runs its own server. The first one you
+start takes port **9876**, which is the port the AI connects to (the *primary*). Each one after that
+takes the next free port: 9877, 9878, and so on up to 9885. The status light shows each window's
+port.
+
+The AI works through the primary instance and reaches the others through `eval_ruby`:
+
+```ruby
+SU_MCP.instances                                   # list every running SketchUp: port, model title, path
+SU_MCP.remote("Electrical", "Sketchup.active_model.entities.size")   # run Ruby in another window
+SU_MCP.remote(9877, "Sketchup.active_model.title")                   # ...or pick it by port
+```
+
+You can name the target by port or by part of its model's title or path. `remote` returns the other
+window's result as text, and a call fails after 10 seconds. To change which window is the primary,
+stop the servers and start the one you want first. All instances must run version 1.6.0 or later;
+an older one still answers `remote`, but `instances` lists it without a title.
 
 ### Which app is Codex?
 

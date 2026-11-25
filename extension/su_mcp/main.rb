@@ -65,7 +65,10 @@ module SU_MCP
             "waiting for it and cannot answer. Turn off Follow Active Window or click the " \
             "primary SketchUp window to work there."
     end
-    req = { jsonrpc: "2.0", method: "tools/call", _mcp_direct: true,
+    # Pass on which app (Claude, Codex) asked, so the other window's status
+    # light names it instead of showing Unknown.
+    app = (@server.current_client rescue nil) || "Unknown"
+    req = { jsonrpc: "2.0", method: "tools/call", _mcp_direct: true, _mcp_client: app,
             params: { name: tool, arguments: args }, id: 1 }.to_json + "\n"
     resp = JSON.parse(send_line(port, req, timeout))
     raise "SketchUp on port #{port}: #{resp['error']['message']}" if resp['error']

@@ -189,15 +189,26 @@ module ElmMCPStatus
     case s
     when :active
       apps = active_clients
-      apps.empty? ? ":#{port} - #{ago_text}" : "#{apps.join(' + ')} - #{ago_text}"
-    when :listening then ":#{port} - idle"
+      apps.empty? ? ago_text : "#{apps.join(' + ')} - #{ago_text}"
+    when :listening then "idle"
     when :stopped   then "not listening"
     else                 "extension absent"
     end
   end
 
+  # Headline plus the port while the server runs, e.g. "ACTIVE :9877", so
+  # each SketchUp window shows which port it took.
+  def self.panel_head(s = state)
+    [:active, :listening].include?(s) ? "#{headline(s)} :#{port}" : headline(s)
+  end
+
+  # 9876 is where Claude and Codex connect; other ports are reached through it.
+  def self.role_text
+    port == 9876 ? "primary: Claude and Codex connect here" : "secondary: reached through port 9876"
+  end
+
   def self.label(s = state)
-    "MCP #{headline(s)} - #{subline(s)}"
+    "MCP #{panel_head(s)} - #{subline(s)}"
   end
 
   # --- status panel ------------------------------------------------------
@@ -268,7 +279,9 @@ module ElmMCPStatus
           end
     return unless vis
     s = state
-    meta = "MCP #{headline(s)} on port #{port}\n"
+    meta = "MCP #{headline(s)} on port #{port}"
+    meta += " (#{role_text})" if [:active, :listening].include?(s)
+    meta += "\n"
     meta += "#{request_count} requests handled, last #{ago_text}"
     meta += "\nlast method: #{last_method}" if last_method
     clients.each do |name, e|
@@ -276,7 +289,7 @@ module ElmMCPStatus
     end
     meta += "\nTRACKING NOT ATTACHED" unless @patched
     @dlg.execute_script(
-      "window.setState(#{s.to_s.inspect},#{headline(s).inspect}," \
+      "window.setState(#{s.to_s.inspect},#{panel_head(s).inspect}," \
       "#{subline(s).inspect},#{meta.inspect},#{(s == :stopped).inspect});"
     )
     # Grow only when the Start button needs room, shrink back otherwise.
